@@ -12,6 +12,9 @@ const router = express.Router();
 // Solana Connection
 const connection = new Connection(clusterApiUrl('mainnet-beta'));
 
+// In-Memory State
+const activeTrades = []; // Tracks active trades and stop-loss monitoring
+
 // Fetch Wallet Token Balances
 async function fetchWalletTokens(walletAddress) {
     try {
@@ -33,43 +36,6 @@ async function fetchWalletTokens(walletAddress) {
     }
 }
 
-// Trading Strategies
-class TradingStrategies {
-    constructor(priceData) {
-        this.priceData = priceData;
-    }
-
-    trendFollowing(shortWindow = 5, longWindow = 10) {
-        const shortMA = this.movingAverage(this.priceData.slice(-shortWindow));
-        const longMA = this.movingAverage(this.priceData.slice(-longWindow));
-        if (shortMA > longMA) return "BUY";
-        if (shortMA < longMA) return "SELL";
-        return "HOLD";
-    }
-
-    meanReversion(window = 10, threshold = 0.03) {
-        const movingAvg = this.movingAverage(this.priceData.slice(-window));
-        const currentPrice = this.priceData[this.priceData.length - 1];
-        if (currentPrice < movingAvg * (1 - threshold)) return "BUY";
-        if (currentPrice > movingAvg * (1 + threshold)) return "SELL";
-        return "HOLD";
-    }
-
-    breakout(breakoutWindow = 10) {
-        const breakoutHigh = Math.max(...this.priceData.slice(-breakoutWindow));
-        const breakoutLow = Math.min(...this.priceData.slice(-breakoutWindow));
-        const currentPrice = this.priceData[this.priceData.length - 1];
-
-        if (currentPrice > breakoutHigh) return "BUY";
-        if (currentPrice < breakoutLow) return "SELL";
-        return "HOLD";
-    }
-
-    movingAverage(data) {
-        return data.reduce((a, b) => a + b, 0) / data.length;
-    }
-}
-
 // Fetch Real-Time Price Data from Jupiter API
 async function fetchPriceData(inputMint, outputMint) {
     try {
@@ -87,114 +53,125 @@ async function fetchPriceData(inputMint, outputMint) {
         }
 
         // Extract price data from quotes
-        return quotes.map((quote) => quote.outAmount / 10 ** 6); // Convert smallest unit to base unit
+        return quotes.map((quote) => ({
+            price: quote.outAmount / 10 ** 6, // Convert smallest unit to base unit
+            liquidity: quote.liquidity
+        }));
     } catch (error) {
         console.error('Error fetching price data:', error.message);
         throw error;
     }
 }
 
-// Endpoint to execute trades with strategies, portfolio size trades, and 3% stop-loss
-router.post('/', async (req, res) => {
-    const { strategy = 'trendFollowing', walletAddress } = req.body;
+// Determine the Best Strategy
+function determineBestStrategy(priceData) {
+    const prices = priceData.map((data) => data.price);
+    const shortMA = prices.slice(-5).reduce((a, b) => a + b, 0) / 5;
+    const longMA = prices.slice(-10).reduce((a, b) => a + b, 0) / 10;
+    const currentPrice = prices[prices.length - 1];
 
-    // Validate input
-    if (!strategy || !walletAddress) {
-        return res.status(400).json({ message: 'Strategy and walletAddress are required.' });
+    // Analyze price trends and volatility
+    const isTrending = Math.abs(shortMA - longMA) / longMA > 0.01; // If short MA deviates from long MA by > 1%
+    const isReverting = currentPrice > longMA * 0.97 && currentPrice < longMA * 1.03; // Within 3% of long MA
+    const isBreakingOut = currentPrice > Math.max(...prices.slice(-10)) || currentPrice < Math.min(...prices.slice(-10)); // New high/low
+
+    // Choose the best strategy
+    if (isTrending) return "trendFollowing";
+    if (isReverting) return "meanReversion";
+    if (isBreakingOut) return "breakout";
+
+    return "HOLD"; // Default if no clear signal
+}
+
+// Automated Trading with Best Strategy
+async function automatedTrading(walletAddress, inputMint, outputMint) {
+    console.log("Starting automated trading...");
+
+    const interval = setInterval(async () => {
+        try {
+            // Fetch wallet tokens and validate balance
+            const walletTokens = await fetchWalletTokens(walletAddress);
+            const inputTokenAccount = walletTokens.find((token) => token.mint === inputMint);
+            if (!inputTokenAccount || inputTokenAccount.balance <= 0) {
+                console.log(`Insufficient balance for token ${inputMint}. Skipping trade.`);
+                return;
+            }
+
+            // Fetch price data from Jupiter
+            const priceData = await fetchPriceData(inputMint, outputMint);
+            const bestStrategy = determineBestStrategy(priceData);
+
+            if (bestStrategy === "HOLD") {
+                console.log("No favorable trading strategy. Holding position.");
+                return;
+            }
+
+            console.log(`Best strategy determined: ${bestStrategy}`);
+
+            // Execute trade based on the best strategy
+            const currentPrice = priceData[priceData.length - 1].price;
+            const tradeAmount = inputTokenAccount.balance * 0.05; // 5% of portfolio
+            const transaction = new Transaction();
+            transaction.add(
+                SystemProgram.transfer({
+                    fromPubkey: new PublicKey(walletAddress),
+                    toPubkey: new PublicKey(outputMint), // Replace with actual mint address
+                    lamports: Math.floor(tradeAmount * 10 ** 9) // Example amount in lamports
+                })
+            );
+
+            // Add stop-loss
+            const stopLossPrice = bestStrategy === "trendFollowing" ? currentPrice * 0.97 : currentPrice * 1.03;
+            activeTrades.push({ walletAddress, inputMint, outputMint, stopLossPrice });
+            console.log(`Trade executed. Stop-loss price: ${stopLossPrice}`);
+        } catch (error) {
+            console.error("Error during automated trading:", error.message);
+        }
+    }, 10000); // Run every 10 seconds
+
+    return interval;
+}
+
+// Stop-Loss Monitoring
+async function monitorStopLoss() {
+    console.log("Starting stop-loss monitoring...");
+    setInterval(() => {
+        activeTrades.forEach(async (trade, index) => {
+            try {
+                const priceData = await fetchPriceData(trade.inputMint, trade.outputMint);
+                const currentPrice = priceData[priceData.length - 1].price;
+                console.log(`Checking stop-loss for ${trade.inputMint}. Current price: ${currentPrice}, Stop-loss price: ${trade.stopLossPrice}`);
+
+                if ((trade.inputMint === "BUY" && currentPrice <= trade.stopLossPrice) ||
+                    (trade.inputMint === "SELL" && currentPrice >= trade.stopLossPrice)) {
+                    console.log("Stop-loss triggered. Closing trade.");
+                    activeTrades.splice(index, 1); // Remove trade from active list
+                }
+            } catch (error) {
+                console.error("Error during stop-loss monitoring:", error.message);
+            }
+        });
+    }, 5000); // Check every 5 seconds
+}
+
+// Endpoint to Start Automated Trading
+router.post('/start-automation', async (req, res) => {
+    const { walletAddress, inputMint, outputMint } = req.body;
+
+    if (!walletAddress || !inputMint || !outputMint) {
+        return res.status(400).json({ message: 'Missing required parameters.' });
     }
 
     try {
-        // Fetch the user's wallet tokens
-        const walletTokens = await fetchWalletTokens(walletAddress);
-        console.log('Wallet Tokens:', walletTokens);
-
-        // Determine input token and fetch its balance
-        const inputToken = strategy === 'trendFollowing' ? 'USDC' : 'SOL'; // Example token selection logic
-        const inputTokenAccount = walletTokens.find((token) => token.mint === inputToken);
-        if (!inputTokenAccount) {
-            return res.status(400).json({ message: `Input token (${inputToken}) not found in wallet.` });
-        }
-
-        // Calculate trade amount (5% of portfolio size)
-        const portfolioSize = inputTokenAccount.balance;
-        const tradeAmount = portfolioSize * 0.05; // 5% of the portfolio
-        if (tradeAmount <= 0) {
-            return res.status(400).json({ message: 'Insufficient balance for trade.' });
-        }
-
-        // Fetch real-time price data for the trade
-        const priceData = await fetchPriceData('USDC', 'SOL');
-        const entryPrice = priceData[priceData.length - 1]; // Current price
-
-        // Set stop-loss price (3% below entry price)
-        const stopLossPrice = entryPrice * 0.97;
-
-        // Initialize strategies with fetched price data
-        const strategies = new TradingStrategies(priceData);
-
-        // Decide action based on the selected strategy
-        let action;
-        if (strategy === 'trendFollowing') {
-            action = strategies.trendFollowing();
-        } else if (strategy === 'meanReversion') {
-            action = strategies.meanReversion();
-        } else if (strategy === 'breakout') {
-            action = strategies.breakout();
-        } else {
-            return res.status(400).json({ message: 'Invalid strategy selected.' });
-        }
-
-        if (action === 'HOLD') {
-            return res.json({ message: 'No trade executed. Strategy indicates HOLD.' });
-        }
-
-        // Determine trade details
-        const outputToken = action === 'BUY' ? 'SOL' : 'USDC';
-
-        // Fetch a trade quote from the Jupiter API
-        const quoteResponse = await axios.get('https://quote-api.jup.ag/v4/quote', {
-            params: {
-                inputMint: inputToken,
-                outputMint: outputToken,
-                amount: Math.floor(tradeAmount * 10 ** 6), // Convert to smallest unit
-                slippage: 1 // 1% slippage tolerance
-            }
-        });
-
-        const quote = quoteResponse.data;
-
-        if (!quote.data || quote.data.length === 0) {
-            return res.status(404).json({ message: 'No trade routes found for the specified pair.' });
-        }
-
-        // Create a transaction for the trade
-        const bestRoute = quote.data[0];
-        const transaction = new Transaction();
-        transaction.add(
-            SystemProgram.transfer({
-                fromPubkey: new PublicKey(walletAddress),
-                toPubkey: new PublicKey(bestRoute.outMint),
-                lamports: Math.floor(tradeAmount * 10 ** 9)
-            })
-        );
-
-        // Serialize the transaction for signing by Phantom Wallet
-        const serializedTransaction = transaction.serialize({
-            requireAllSignatures: false
-        });
-
-        // Send the serialized transaction back to the frontend for signing
-        res.json({
-            message: 'Transaction created successfully.',
-            serializedTransaction: serializedTransaction.toString('base64'),
-            bestRoute,
-            entryPrice,
-            stopLossPrice
-        });
+        const tradingLoop = await automatedTrading(walletAddress, inputMint, outputMint);
+        res.json({ message: 'Automated trading started successfully.', tradingLoop });
     } catch (error) {
-        console.error('Error executing trade:', error.message);
-        res.status(500).json({ message: 'An error occurred during trade execution.', error: error.message });
+        console.error("Error starting automated trading:", error.message);
+        res.status(500).json({ message: 'Failed to start automated trading.', error: error.message });
     }
 });
+
+// Start Stop-Loss Monitoring
+monitorStopLoss();
 
 module.exports = router;
