@@ -1,12 +1,37 @@
 const express = require('express');
 const axios = require('axios');
+const {
+    Connection,
+    clusterApiUrl,
+    PublicKey,
+    Transaction,
+    SystemProgram
+} = require('@solana/web3.js');
 const router = express.Router();
 
-// Mock Portfolio (Replace with a database in the future)
-let portfolio = {
-    USDC: 1000,
-    SOL: 0
-};
+// Solana Connection
+const connection = new Connection(clusterApiUrl('mainnet-beta'));
+
+// Fetch Wallet Token Balances
+async function fetchWalletTokens(walletAddress) {
+    try {
+        const publicKey = new PublicKey(walletAddress);
+        const tokenAccounts = await connection.getParsedTokenAccountsByOwner(publicKey, {
+            programId: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA') // SPL Token program ID
+        });
+        const tokens = tokenAccounts.value.map((account) => {
+            const data = account.account.data.parsed.info;
+            return {
+                mint: data.mint,
+                balance: parseFloat(data.tokenAmount.uiAmount)
+            };
+        });
+        return tokens;
+    } catch (error) {
+        console.error('Error fetching wallet tokens:', error.message);
+        throw new Error('Failed to fetch wallet tokens.');
+    }
+}
 
 // Trading Strategies
 class TradingStrategies {
@@ -40,16 +65,6 @@ class TradingStrategies {
         return "HOLD";
     }
 
-    adaptiveTrend(shortWindow = 5, longWindow = 10, threshold = 0.01) {
-        const shortMA = this.movingAverage(this.priceData.slice(-shortWindow));
-        const longMA = this.movingAverage(this.priceData.slice(-longWindow));
-        const difference = Math.abs(shortMA - longMA) / longMA;
-
-        if (shortMA > longMA && difference > threshold) return "BUY";
-        if (shortMA < longMA && difference > threshold) return "SELL";
-        return "HOLD";
-    }
-
     movingAverage(data) {
         return data.reduce((a, b) => a + b, 0) / data.length;
     }
@@ -72,25 +87,47 @@ async function fetchPriceData(inputMint, outputMint) {
         }
 
         // Extract price data from quotes
-        return quotes.map(quote => quote.outAmount / 10 ** 6); // Convert smallest unit to base unit
+        return quotes.map((quote) => quote.outAmount / 10 ** 6); // Convert smallest unit to base unit
     } catch (error) {
         console.error('Error fetching price data:', error.message);
         throw error;
     }
 }
 
-// Endpoint to execute trades using strategies and Jupiter API
+// Endpoint to execute trades with strategies, portfolio size trades, and 3% stop-loss
 router.post('/', async (req, res) => {
-    const { strategy = 'trendFollowing', amount } = req.body;
+    const { strategy = 'trendFollowing', walletAddress } = req.body;
 
     // Validate input
-    if (!strategy || !amount) {
-        return res.status(400).json({ message: 'Strategy and amount are required.' });
+    if (!strategy || !walletAddress) {
+        return res.status(400).json({ message: 'Strategy and walletAddress are required.' });
     }
 
     try {
-        // Fetch real-time price data for USDC → SOL
+        // Fetch the user's wallet tokens
+        const walletTokens = await fetchWalletTokens(walletAddress);
+        console.log('Wallet Tokens:', walletTokens);
+
+        // Determine input token and fetch its balance
+        const inputToken = strategy === 'trendFollowing' ? 'USDC' : 'SOL'; // Example token selection logic
+        const inputTokenAccount = walletTokens.find((token) => token.mint === inputToken);
+        if (!inputTokenAccount) {
+            return res.status(400).json({ message: `Input token (${inputToken}) not found in wallet.` });
+        }
+
+        // Calculate trade amount (5% of portfolio size)
+        const portfolioSize = inputTokenAccount.balance;
+        const tradeAmount = portfolioSize * 0.05; // 5% of the portfolio
+        if (tradeAmount <= 0) {
+            return res.status(400).json({ message: 'Insufficient balance for trade.' });
+        }
+
+        // Fetch real-time price data for the trade
         const priceData = await fetchPriceData('USDC', 'SOL');
+        const entryPrice = priceData[priceData.length - 1]; // Current price
+
+        // Set stop-loss price (3% below entry price)
+        const stopLossPrice = entryPrice * 0.97;
 
         // Initialize strategies with fetched price data
         const strategies = new TradingStrategies(priceData);
@@ -103,31 +140,23 @@ router.post('/', async (req, res) => {
             action = strategies.meanReversion();
         } else if (strategy === 'breakout') {
             action = strategies.breakout();
-        } else if (strategy === 'adaptiveTrend') {
-            action = strategies.adaptiveTrend();
         } else {
             return res.status(400).json({ message: 'Invalid strategy selected.' });
         }
 
         if (action === 'HOLD') {
-            return res.json({ message: 'No trade executed. Strategy indicates HOLD.', portfolio });
+            return res.json({ message: 'No trade executed. Strategy indicates HOLD.' });
         }
 
-        // Determine input and output tokens based on action
-        const inputToken = action === 'BUY' ? 'USDC' : 'SOL';
+        // Determine trade details
         const outputToken = action === 'BUY' ? 'SOL' : 'USDC';
-
-        // Validate portfolio balance
-        if (portfolio[inputToken] < amount) {
-            return res.status(400).json({ message: `Insufficient balance for ${inputToken}.` });
-        }
 
         // Fetch a trade quote from the Jupiter API
         const quoteResponse = await axios.get('https://quote-api.jup.ag/v4/quote', {
             params: {
                 inputMint: inputToken,
                 outputMint: outputToken,
-                amount: Math.floor(amount * 10 ** 6), // Convert to smallest unit
+                amount: Math.floor(tradeAmount * 10 ** 6), // Convert to smallest unit
                 slippage: 1 // 1% slippage tolerance
             }
         });
@@ -138,27 +167,32 @@ router.post('/', async (req, res) => {
             return res.status(404).json({ message: 'No trade routes found for the specified pair.' });
         }
 
-        // Simulate trade execution by updating the portfolio
-        const bestQuote = quote.data[0];
-        const outputAmount = bestQuote.outAmount / 10 ** 6; // Convert back to base units
+        // Create a transaction for the trade
+        const bestRoute = quote.data[0];
+        const transaction = new Transaction();
+        transaction.add(
+            SystemProgram.transfer({
+                fromPubkey: new PublicKey(walletAddress),
+                toPubkey: new PublicKey(bestRoute.outMint),
+                lamports: Math.floor(tradeAmount * 10 ** 9)
+            })
+        );
 
-        portfolio[inputToken] -= amount;
-        portfolio[outputToken] = (portfolio[outputToken] || 0) + outputAmount;
+        // Serialize the transaction for signing by Phantom Wallet
+        const serializedTransaction = transaction.serialize({
+            requireAllSignatures: false
+        });
 
-        // Return trade execution details
+        // Send the serialized transaction back to the frontend for signing
         res.json({
-            message: 'Trade executed successfully',
-            strategy,
-            action,
-            inputToken,
-            outputToken,
-            inputAmount: amount,
-            outputAmount,
-            priceImpact: bestQuote.priceImpactPct,
-            updatedPortfolio: portfolio
+            message: 'Transaction created successfully.',
+            serializedTransaction: serializedTransaction.toString('base64'),
+            bestRoute,
+            entryPrice,
+            stopLossPrice
         });
     } catch (error) {
-        console.error('Trade execution failed:', error);
+        console.error('Error executing trade:', error.message);
         res.status(500).json({ message: 'An error occurred during trade execution.', error: error.message });
     }
 });
