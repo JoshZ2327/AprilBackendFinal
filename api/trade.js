@@ -1,73 +1,142 @@
-const express = require("express");
-const TradingStrategies = require("./path/to/TradingStrategies"); // Adjust the path
+const express = require('express');
+const axios = require('axios');
 const router = express.Router();
 
-// Mock data
-let portfolio = { USDC: 1000, SOL: 2.5 };
-let tradeHistory = [];
-let priceData = [100, 102, 101, 103, 105, 104, 106, 107, 105, 108, 109, 110]; // Replace with real API data
+// Mock Portfolio (Replace with a database in the future)
+let portfolio = {
+    USDC: 1000,
+    SOL: 0
+};
 
-router.post("/", (req, res) => {
-  const { strategy = "trendFollowing", amount = 50 } = req.body;
+// Trading Strategies
+class TradingStrategies {
+    constructor(priceData) {
+        this.priceData = priceData;
+    }
 
-  // Ensure sufficient price data
-  if (priceData.length < 20) {
-    return res.status(400).json({ error: "Insufficient price data for strategies" });
-  }
+    trendFollowing(shortWindow = 5, longWindow = 10) {
+        const shortMA = this.movingAverage(this.priceData.slice(-shortWindow));
+        const longMA = this.movingAverage(this.priceData.slice(-longWindow));
+        if (shortMA > longMA) return "BUY";
+        if (shortMA < longMA) return "SELL";
+        return "HOLD";
+    }
 
-  // Initialize the trading strategy
-  const strategies = new TradingStrategies(priceData);
-  let decision;
+    meanReversion(window = 10, threshold = 0.03) {
+        const movingAvg = this.movingAverage(this.priceData.slice(-window));
+        const currentPrice = this.priceData[this.priceData.length - 1];
+        if (currentPrice < movingAvg * (1 - threshold)) return "BUY";
+        if (currentPrice > movingAvg * (1 + threshold)) return "SELL";
+        return "HOLD";
+    }
 
-  // Execute the selected strategy
-  if (strategy === "trendFollowing") {
-    decision = strategies.trendFollowing();
-  } else if (strategy === "meanReversion") {
-    decision = strategies.meanReversion();
-  } else if (strategy === "breakout") {
-    decision = strategies.breakout();
-  } else {
-    return res.status(400).json({ error: "Invalid strategy" });
-  }
+    movingAverage(data) {
+        return data.reduce((a, b) => a + b, 0) / data.length;
+    }
+}
 
-  // Handle trade decision
-  let inputToken, outputToken;
-  if (decision === "BUY") {
-    inputToken = "USDC";
-    outputToken = "SOL";
-  } else if (decision === "SELL") {
-    inputToken = "SOL";
-    outputToken = "USDC";
-  } else {
-    return res.json({ decision: "HOLD", message: "No action taken" });
-  }
+// Fetch Real-Time Price Data from Jupiter API
+async function fetchPriceData(inputMint, outputMint) {
+    try {
+        const response = await axios.get('https://quote-api.jup.ag/v4/quote', {
+            params: {
+                inputMint,
+                outputMint,
+                amount: 1 * 10 ** 6 // Mocking a small amount for price data (1 unit of input token)
+            }
+        });
+        const quotes = response.data.data;
 
-  // Ensure sufficient balance for trade
-  if (portfolio[inputToken] < amount) {
-    return res.status(400).json({ error: "Insufficient balance" });
-  }
+        if (!quotes || quotes.length === 0) {
+            throw new Error('No price data available');
+        }
 
-  // Execute trade (mock logic)
-  portfolio[inputToken] -= amount;
-  portfolio[outputToken] += amount * 1.01; // Simulated price increase
+        // Extract prices from quotes
+        return quotes.map(quote => quote.outAmount / 10 ** 6); // Convert smallest unit to base unit
+    } catch (error) {
+        console.error('Error fetching price data:', error.message);
+        throw error;
+    }
+}
 
-  // Record trade in history
-  tradeHistory.push({
-    timestamp: new Date().toISOString(),
-    strategy,
-    decision,
-    inputToken,
-    outputToken,
-    amount,
-  });
+// Endpoint to execute trades using strategies and Jupiter API
+router.post('/', async (req, res) => {
+    const { strategy = 'trendFollowing', amount } = req.body;
 
-  return res.json({
-    success: true,
-    decision,
-    inputToken,
-    outputToken,
-    portfolio,
-  });
+    // Validate input
+    if (!strategy || !amount) {
+        return res.status(400).json({ message: 'Strategy and amount are required.' });
+    }
+
+    try {
+        // Fetch real-time price data for USDC → SOL
+        const priceData = await fetchPriceData('USDC', 'SOL');
+
+        // Initialize strategies with fetched price data
+        const strategies = new TradingStrategies(priceData);
+
+        // Decide action based on the selected strategy
+        let action;
+        if (strategy === 'trendFollowing') {
+            action = strategies.trendFollowing();
+        } else if (strategy === 'meanReversion') {
+            action = strategies.meanReversion();
+        } else {
+            return res.status(400).json({ message: 'Invalid strategy selected.' });
+        }
+
+        if (action === 'HOLD') {
+            return res.json({ message: 'No trade executed. Strategy indicates HOLD.', portfolio });
+        }
+
+        // Determine input and output tokens based on action
+        const inputToken = action === 'BUY' ? 'USDC' : 'SOL';
+        const outputToken = action === 'BUY' ? 'SOL' : 'USDC';
+
+        // Validate portfolio balance
+        if (portfolio[inputToken] < amount) {
+            return res.status(400).json({ message: `Insufficient balance for ${inputToken}.` });
+        }
+
+        // Fetch a trade quote from the Jupiter API
+        const quoteResponse = await axios.get('https://quote-api.jup.ag/v4/quote', {
+            params: {
+                inputMint: inputToken,
+                outputMint: outputToken,
+                amount: Math.floor(amount * 10 ** 6), // Convert to smallest unit
+                slippage: 1 // 1% slippage tolerance
+            }
+        });
+
+        const quote = quoteResponse.data;
+
+        if (!quote.data || quote.data.length === 0) {
+            return res.status(404).json({ message: 'No trade routes found for the specified pair.' });
+        }
+
+        // Simulate trade execution by updating the portfolio
+        const bestQuote = quote.data[0];
+        const outputAmount = bestQuote.outAmount / 10 ** 6; // Convert back to base units
+
+        portfolio[inputToken] -= amount;
+        portfolio[outputToken] = (portfolio[outputToken] || 0) + outputAmount;
+
+        // Return trade execution details
+        res.json({
+            message: 'Trade executed successfully',
+            strategy,
+            action,
+            inputToken,
+            outputToken,
+            inputAmount: amount,
+            outputAmount,
+            priceImpact: bestQuote.priceImpactPct,
+            updatedPortfolio: portfolio
+        });
+    } catch (error) {
+        console.error('Trade execution failed:', error);
+        res.status(500).json({ message: 'An error occurred during trade execution.', error: error.message });
+    }
 });
 
 module.exports = router;
