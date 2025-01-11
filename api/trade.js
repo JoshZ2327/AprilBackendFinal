@@ -30,6 +30,26 @@ class TradingStrategies {
         return "HOLD";
     }
 
+    breakout(breakoutWindow = 10) {
+        const breakoutHigh = Math.max(...this.priceData.slice(-breakoutWindow));
+        const breakoutLow = Math.min(...this.priceData.slice(-breakoutWindow));
+        const currentPrice = this.priceData[this.priceData.length - 1];
+
+        if (currentPrice > breakoutHigh) return "BUY";
+        if (currentPrice < breakoutLow) return "SELL";
+        return "HOLD";
+    }
+
+    adaptiveTrend(shortWindow = 5, longWindow = 10, threshold = 0.01) {
+        const shortMA = this.movingAverage(this.priceData.slice(-shortWindow));
+        const longMA = this.movingAverage(this.priceData.slice(-longWindow));
+        const difference = Math.abs(shortMA - longMA) / longMA;
+
+        if (shortMA > longMA && difference > threshold) return "BUY";
+        if (shortMA < longMA && difference > threshold) return "SELL";
+        return "HOLD";
+    }
+
     movingAverage(data) {
         return data.reduce((a, b) => a + b, 0) / data.length;
     }
@@ -42,7 +62,7 @@ async function fetchPriceData(inputMint, outputMint) {
             params: {
                 inputMint,
                 outputMint,
-                amount: 1 * 10 ** 6 // Mocking a small amount for price data (1 unit of input token)
+                amount: 1 * 10 ** 6 // Simulate fetching price for 1 unit of input token
             }
         });
         const quotes = response.data.data;
@@ -51,7 +71,7 @@ async function fetchPriceData(inputMint, outputMint) {
             throw new Error('No price data available');
         }
 
-        // Extract prices from quotes
+        // Extract price data from quotes
         return quotes.map(quote => quote.outAmount / 10 ** 6); // Convert smallest unit to base unit
     } catch (error) {
         console.error('Error fetching price data:', error.message);
@@ -81,6 +101,10 @@ router.post('/', async (req, res) => {
             action = strategies.trendFollowing();
         } else if (strategy === 'meanReversion') {
             action = strategies.meanReversion();
+        } else if (strategy === 'breakout') {
+            action = strategies.breakout();
+        } else if (strategy === 'adaptiveTrend') {
+            action = strategies.adaptiveTrend();
         } else {
             return res.status(400).json({ message: 'Invalid strategy selected.' });
         }
