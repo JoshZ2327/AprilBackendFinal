@@ -1,0 +1,32 @@
+const dotenv = require('dotenv');
+
+// Load environment variables from a .env file if available
+dotenv.config();
+
+// Helper function to parse and validate environment variables
+function parseEnvVariable(key, defaultValue, parser = parseFloat) {
+    const value = process.env[key];
+    if (value === undefined || value === null || value.trim() === '') {
+        console.warn(`[WARN] Environment variable "${key}" is missing or empty. Using default: ${defaultValue}`);
+        return defaultValue;
+    }
+
+    try {
+        return parser(value);
+    } catch (error) {
+        console.error(`[ERROR] Failed to parse environment variable "${key}":`, error.message);
+        return defaultValue;
+    }
+}
+
+// Configuration object
+const config = {
+    RPC_URL: process.env.RPC_URL || 'https://api.mainnet-beta.solana.com',
+    JUPITER_API: process.env.JUPITER_API || 'https://quote-api.jup.ag/v4/quote',
+    DEFAULT_GAS_RESERVE: parseEnvVariable('DEFAULT_GAS_RESERVE', 0.01, parseFloat),
+    STOP_LOSS_PERCENTAGE: parseEnvVariable('STOP_LOSS_PERCENTAGE', 0.01, parseFloat),
+};
+
+console.log("[INFO] Loaded configuration:", config);
+
+module.exports = config;
